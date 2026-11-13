@@ -1,7 +1,7 @@
 ## Interface: 16001
 ## Title: AbsorbArc
 ## Notes: Shows the remaining absorb of Ice Barrier, Power Word: Shield, Mana Shield, the Wards and Sacrifice as bars (arc or straight). /aa opens the config.
-## Version: 0.5.3
+## Version: 0.5.4
 ## SavedVariablesPerCharacter: AbsorbArcCharDB
 
 AbsorbArc.lua

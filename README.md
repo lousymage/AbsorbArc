@@ -14,7 +14,7 @@ with the remaining amount and the seconds left next to it.
   side, opacity and position
 - settings saved per character
 
-For **WoW: Forever** (client 1.60.1). Version **0.5.3**.
+For **WoW: Forever** (client 1.60.1). Version **0.5.4**.
 
 ## Shields
 
@@ -51,14 +51,18 @@ absorb only as a value addons can display but not calculate with. So:
   game's total absorb, drawn by the game into the arc. At 0 the arc disappears.
 - **A priest's shield** in combat is recognized when your absorb changes at the
   same moment a new buff appears.
-- **Mana Shield** has no readable amount at all; it is counted down from the mana
-  you lose (2 mana per point absorbed).
+- **A shield that breaks** in combat is recognized when a buff disappears that
+  wasn't due to run out; its arc goes away.
+- **Mana Shield** has no readable amount at all (WoW: Forever hides your mana
+  and the damage numbers during combat). It shrinks with every hit it absorbs,
+  by an estimate marked `~`: after each fight AbsorbArc reads the exact
+  absorbed amount from the game's damage meter and learns per enemy and level
+  (your target) how much one hit takes.
 
 **Limits:** with several shields up in combat each arc shows the total (marked
-`~`); a broken shield keeps its arc until its timer ends if another shield is
-still up; mana lost to an enemy drain counts as absorbed by Mana Shield. Shield
-sizes come from English spell descriptions; other languages work after you have
-cast a shield once out of combat.
+`~`); if two shields of the same kind of tracking break at once, their arcs stay
+until their timers end. Shield sizes come from English spell descriptions; other
+languages work after you have cast a shield once out of combat.
 
 ## License
 

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.5.4
+
+- Fixed: the Mana Shield arc stayed after the shield broke. A shield that
+  breaks in combat is now recognized and its arc disappears.
+- Mana Shield shrinks with every hit it absorbs. WoW: Forever hides your mana
+  and the damage numbers from addons, so the amount is an estimate (shown with
+  `~`): after each fight AbsorbArc reads from the game's damage meter how
+  much your Mana Shield really absorbed, and learns per enemy and level how
+  much one absorbed hit takes. New enemies use what it learned from enemies
+  of a similar level. A Mana Shield that survives a fight shows its exact
+  remaining amount afterwards.
+- `/aa debug` also writes a log into the saved variables; `/aa total` shows
+  the game's total absorb (for testing).
+
 ## 0.5.3
 
 - The download now contains only the files the game needs (no README,

@@ -1,4 +1,4 @@
--- AbsorbArc 0.5.3 -- WoW: Forever (client 1.60.1, interface 16001, Lua 5.1)
+-- AbsorbArc 0.5.4 -- WoW: Forever (client 1.60.1, interface 16001, Lua 5.1)
 -- Shows the remaining absorb of several shield spells as bars (arc or
 -- straight) next to each other.
 --
@@ -58,27 +58,32 @@ local SHIELDS = {
 		fallback = 570,
 		color = { 0.25, 0.35, 1.0 },
 		ids = { 1463, 8494, 8495, 10191, 10192, 10193 },
-		-- its aura has no points: tracked through the player's mana instead
-		-- (each absorbed point of damage costs "ratio" mana)
-		mana = true,
+		-- neither its aura (no points) nor the player's mana (always secret
+		-- on Forever) tells how much is left: estimated from the number of
+		-- absorbed hits, see OnAbsorbedHit
+		noAmount = true,
+		schools = 1, -- physical only (its spell description says so)
 	},
 	["Fire Ward"] = {
 		duration = 30,
 		fallback = 675,
 		color = { 1.0, 0.4, 0.1 },
 		ids = { 543, 8457, 8458, 10223, 10225 },
+		schools = 4,
 	},
 	["Frost Ward"] = {
 		duration = 30,
 		fallback = 675,
 		color = { 0.2, 1.0, 0.8 },
 		ids = { 6143, 8461, 8462, 10177, 28609 },
+		schools = 16,
 	},
 	["Shadow Ward"] = {
 		duration = 30,
 		fallback = 675,
 		color = { 0.7, 0.35, 1.0 },
 		ids = { 6229, 11739, 11740, 28610 },
+		schools = 32,
 	},
 	["Sacrifice"] = {
 		duration = 30,
@@ -123,6 +128,8 @@ local geo = { sc = 1, L = 471, size = 12, theta = PI, side = "left", p = 18, tex
 local DOT_QUAD = 32 / 26
 local lastN = -1
 local shields = {} -- shield name -> state table
+-- the current fight, for Mana Shield learning (see NewFight / LearnAfterFight)
+local fight = { hits = 0, keys = {}, unsure = false, casts = 0, breaks = {} }
 local test = nil
 local testKeys = { {}, {}, {} }
 local previewKeys = { {}, {}, {} }
@@ -131,9 +138,29 @@ local function say(t)
 	DEFAULT_CHAT_FRAME:AddMessage("|cff66ccffAbsorbArc:|r " .. t)
 end
 
+-- With /aa debug, every line also goes into the saved variables
+-- (AbsorbArcCharDB.debugLog, written on /reload or logout).
+local DEBUG_LOG_MAX = 1000
+
+local function trace(t)
+	if DB and DB.debug then
+		local log = DB.debugLog
+		if type(log) ~= "table" then
+			log = {}
+			DB.debugLog = log
+		end
+		local lock = InCombatLockdown and InCombatLockdown() and " [combat]" or ""
+		log[#log + 1] = string.format("%.2f%s %s", GetTime(), lock, t)
+		if #log > DEBUG_LOG_MAX then
+			table.remove(log, 1)
+		end
+	end
+end
+
 local function dbg(t)
 	if DB and DB.debug then
 		DEFAULT_CHAT_FRAME:AddMessage(string.format("|cff888888AbsorbArc %.1f:|r %s", GetTime(), t))
+		trace(t)
 	end
 end
 
@@ -199,11 +226,9 @@ end
 -- Maximum values
 ------------------------------------------------------------------------
 
--- Base value from the spell description ("absorbing 432 damage") and, for
--- Mana Shield, the mana per absorbed damage ("Drains 2.0 mana per damage").
+-- Base value from the spell description ("absorbing 432 damage").
 -- Descriptions load asynchronously, so this is filled over time.
 local descBase = {}
-local descRatio = {}
 
 local function CacheDescriptions()
 	if not (C_Spell and C_Spell.GetSpellDescription) then
@@ -216,10 +241,6 @@ local function CacheDescriptions()
 				local v = string.match(d, "[Aa]bsorb%a*%s+(%d+)")
 				if v then
 					descBase[id] = tonumber(v)
-				end
-				local r = string.match(d, "(%d+%.?%d*) mana per damage")
-				if r and tonumber(r) and tonumber(r) > 0 then
-					descRatio[id] = tonumber(r)
 				end
 			elseif C_Spell.RequestLoadSpellData then
 				pcall(C_Spell.RequestLoadSpellData, id)
@@ -269,12 +290,19 @@ local function NewShield(name, spellId, source)
 		appliedAt = nil, -- aura's expirationTime - duration (changes on a refresh)
 		max = nil,
 		rem = nil, -- plain remaining absorb, nil = unknown (use the secret total)
-		consumed = 0, -- Mana Shield: absorbed so far, from mana drops
 		est = false, -- remaining value is partly estimated (shown with ~)
+		hits = 0, -- Mana Shield: absorbed hits counted so far
+		absorbed = 0, -- Mana Shield: estimated damage absorbed so far
+		hitKeys = {}, -- Mana Shield: enemy -> absorbed hits while targeting it
+		unsure = nil, -- Mana Shield: a hit may have been taken by another shield
 		idx = nil, -- index of the absorb amount in the aura's points
 		inst = nil,
 	}
 end
+
+-- expirationTime of every buff from the last readable scan: in combat a
+-- buff button that disappears at one of these times was no broken shield
+local buffExpiries = {}
 
 -- Read all shield auras. Returns name -> info, or nil when the auras can't
 -- be read (in combat they are blocked for addons).
@@ -283,6 +311,7 @@ local function ScanAuras()
 		return nil
 	end
 	local found = {}
+	local expiries = {}
 	for i = 1, 40 do
 		local ok, aura = pcall(C_UnitAuras.GetAuraDataByIndex, "player", i, "HELPFUL")
 		if (not ok) or IsSecret(aura) then
@@ -290,6 +319,10 @@ local function ScanAuras()
 		end
 		if aura == nil then
 			break
+		end
+		local exp = Plain(Get(aura, "expirationTime"))
+		if type(exp) == "number" and exp > 0 then
+			expiries[#expiries + 1] = exp
 		end
 		local sid = Plain(Get(aura, "spellId"))
 		local name = Plain(Get(aura, "name"))
@@ -323,7 +356,67 @@ local function ScanAuras()
 			}
 		end
 	end
+	buffExpiries = expiries
 	return found
+end
+
+-- Mana Shield: every hit it absorbs is reported (UNIT_COMBAT, flag ABSORB),
+-- only the amount is secret. Each such hit takes the learned damage per
+-- absorbed hit off the estimate; at every break that value is learned again
+-- from max / hits (see OnShieldBroke).
+local HIT_DEFAULT = 24 -- first in-game test: 120 absorbed in 5 hits
+local HIT_LEARN = 0.5 -- weight of the newest shield in the learned value
+
+-- The enemy a hit is credited to: the player's target, as "name (level)".
+-- UNIT_COMBAT doesn't say who hit; nil when there is no hostile target or
+-- its name/level are secret.
+local function EnemyKey()
+	local okA, hostile = pcall(UnitCanAttack, "player", "target")
+	if not okA or IsSecret(hostile) or not hostile then
+		return nil
+	end
+	local okN, name = pcall(UnitName, "target")
+	local okL, level = pcall(UnitLevel, "target")
+	name, level = okN and Plain(name), okL and Plain(level)
+	if type(name) ~= "string" or name == "" or type(level) ~= "number" then
+		return nil
+	end
+	return name .. " (" .. level .. ")"
+end
+
+-- learned damage per absorbed hit: for this enemy; else the average of
+-- known enemies within 2 levels; else over all shields
+local LEVEL_RANGE = 2
+
+local function DamagePerHit(key)
+	local v = key and Positive(DB.hitByEnemy[key])
+	if v then
+		return v
+	end
+	local level = key and tonumber(string.match(key, "%((%-?%d+)%)$"))
+	if level then
+		local sum, n = 0, 0
+		for k, d in pairs(DB.hitByEnemy) do
+			local l = tonumber(string.match(k, "%((%-?%d+)%)$"))
+			if l and math.abs(l - level) <= LEVEL_RANGE and Positive(d) then
+				sum, n = sum + d, n + 1
+			end
+		end
+		if n > 0 then
+			return sum / n
+		end
+	end
+	return Positive(DB.dmgPerAbsorbedHit) or HIT_DEFAULT
+end
+
+local function EstimateRem(st)
+	local r = st.max - (st.absorbed or 0)
+	local sliver = st.max * 0.05 -- the shield is still up: keep a sliver
+	if r < sliver then
+		r = sliver
+	end
+	st.rem = r
+	st.est = true
 end
 
 -- Take over exact aura data. Shields not found any more are gone.
@@ -341,7 +434,9 @@ local function ApplyScan(found)
 				st.gained = old.gained
 				if not fresh then
 					-- the same shield, known before from a cast in combat
-					st.max, st.consumed, st.est = old.max, old.consumed, old.est
+					st.max, st.est = old.max, old.est
+					st.hits, st.unsure = old.hits, old.unsure
+					st.absorbed, st.hitKeys = old.absorbed, old.hitKeys
 				end
 			end
 			shields[name] = st
@@ -356,17 +451,17 @@ local function ApplyScan(found)
 			local appliedAt = info.expires - info.duration
 			if st.appliedAt and appliedAt > st.appliedAt + 0.5 then
 				dbg(name .. " refreshed")
-				st.consumed, st.est, st.savedMax, st.max = 0, false, nil, nil
+				st.est, st.savedMax, st.max = false, nil, nil
+				st.hits, st.unsure, st.absorbed, st.hitKeys = 0, nil, 0, {}
 			end
 			st.appliedAt = appliedAt
 		end
-		if st.def.mana then
-			-- Mana Shield has no points: full value from the description,
-			-- consumption counted from mana drops
+		if st.def.noAmount then
+			-- Mana Shield: full value from the description, estimated from hits
 			if not st.max then
 				st.max = KnownMax(name, info.spellId, info.mine)
 			end
-			st.rem = math.max(0, st.max - st.consumed)
+			EstimateRem(st)
 		else
 			-- The absorb amount is the largest point when the shield is first
 			-- seen (other effects like Ice Barrier's +15% are small numbers).
@@ -431,10 +526,10 @@ end
 
 -- In combat the auras can't be read, so a value read before the fight would
 -- freeze. Switch those shields to the secret total until combat ends
--- (Mana Shield keeps counting from mana drops).
+-- (Mana Shield keeps its estimate, see SHIELDS).
 local function ForgetAuraValues()
 	for _, st in pairs(shields) do
-		if st.rem and not st.def.mana then
+		if st.rem and not st.def.noAmount then
 			st.rem = nil
 		end
 	end
@@ -445,11 +540,135 @@ end
 local function StartUnseen(name, spellId, source)
 	local st = NewShield(name, spellId, source)
 	st.max = KnownMax(name, spellId, source == "cast")
-	if st.def.mana then
-		st.rem = st.max -- counted down from mana drops
+	if st.def.noAmount then
+		EstimateRem(st)
+		fight.casts = fight.casts + 1
 	end
 	shields[name] = st
 	dbg(name .. " started in combat (" .. source .. ", max " .. st.max .. ")")
+end
+
+-- Per fight: Mana Shield's absorbed hits and from whom. After the fight the
+-- damage meter tells exactly how much Mana Shield absorbed (in combat its
+-- values are secret, afterwards plain), see LearnAfterFight.
+local function NewFight()
+	fight = { hits = 0, keys = {}, unsure = false, casts = 0, breaks = {} }
+end
+
+-- learn a damage-per-hit sample: overall, and per enemy if all hits came
+-- while targeting the same enemy
+local function LearnSample(sample, keys, what)
+	local function Learn(old)
+		old = Positive(old)
+		return old and (old * (1 - HIT_LEARN) + sample * HIT_LEARN) or sample
+	end
+	DB.dmgPerAbsorbedHit = Learn(DB.dmgPerAbsorbedHit)
+	local only, n = nil, 0
+	for k in pairs(keys) do
+		only, n = k, n + 1
+	end
+	if n == 1 and only ~= "?" then
+		DB.hitByEnemy[only] = Learn(DB.hitByEnemy[only])
+		dbg(string.format("%s: learned ~%.0f per hit from %s", what, DB.hitByEnemy[only], only))
+	else
+		dbg(string.format("%s (%s): learned ~%.0f per hit overall", what,
+			n > 1 and "several enemies" or "unknown enemy", DB.dmgPerAbsorbedHit))
+	end
+end
+
+-- A hit on the player was absorbed (UNIT_COMBAT flag ABSORB). It counts for
+-- Mana Shield if Mana Shield can absorb its school and no other tracked
+-- shield could have taken it instead.
+local function OnAbsorbedHit(school)
+	local st = shields["Mana Shield"]
+	if not st then
+		return
+	end
+	if type(school) == "number" and school ~= st.def.schools then
+		trace("absorbed hit of school " .. school .. ": not Mana Shield")
+		return
+	end
+	for name, other in pairs(shields) do
+		if other ~= st and (not other.def.schools or other.def.schools == school) then
+			st.unsure = true
+			fight.unsure = true
+			dbg("Mana Shield: absorbed hit not counted, " .. name .. " may have taken it")
+			return
+		end
+	end
+	local key = EnemyKey()
+	local per = DamagePerHit(key)
+	local k = key or "?"
+	st.hits = (st.hits or 0) + 1
+	st.absorbed = (st.absorbed or 0) + per
+	st.hitKeys[k] = (st.hitKeys[k] or 0) + 1
+	fight.hits = fight.hits + 1
+	fight.keys[k] = (fight.keys[k] or 0) + 1
+	EstimateRem(st)
+	dbg(string.format("Mana Shield: absorbed hit %d from %s, ~%.0f left (~%.0f per hit)",
+		st.hits, key or "unknown enemy", st.rem, per))
+end
+
+-- A Mana Shield broke: remember max / hits as a fallback sample, used only
+-- if the damage meter can't be read after the fight.
+local function OnShieldBroke(st)
+	if not (st.def.noAmount and (st.hits or 0) > 0 and st.max) or st.unsure then
+		return
+	end
+	table.insert(fight.breaks, { sample = st.max / st.hits, keys = st.hitKeys })
+end
+
+-- How much Mana Shield absorbed in the fight that just ended, from the
+-- damage meter (plain after combat); nil if it can't be read.
+local function MeterAbsorbed()
+	local dm, E = C_DamageMeter, Enum
+	if not (dm and dm.GetCombatSessionSourceFromType and E and E.DamageMeterSessionType and E.DamageMeterType) then
+		return nil
+	end
+	local okG, me = pcall(UnitGUID, "player")
+	local ok, src = pcall(dm.GetCombatSessionSourceFromType, E.DamageMeterSessionType.Current,
+		E.DamageMeterType.Absorbs, okG and me or nil)
+	if not ok or IsSecret(src) or type(src) ~= "table" then
+		return nil
+	end
+	local spells = Get(src, "combatSpells")
+	if IsSecret(spells) or type(spells) ~= "table" then
+		return nil
+	end
+	local total = 0
+	for i = 1, #spells do
+		local id, amount = Plain(Get(spells[i], "spellID")), Plain(Get(spells[i], "totalAmount"))
+		if type(id) == "number" and SHIELD_BY_ID[id] == "Mana Shield" then
+			if type(amount) ~= "number" then
+				return nil
+			end
+			total = total + amount
+		end
+	end
+	return total
+end
+
+-- After a fight: learn from the exact absorbed amount (meter) divided by the
+-- counted absorbed hits. A Mana Shield that survived the fight (and was the
+-- only one in it) gets its exact absorbed amount.
+local function LearnAfterFight()
+	local absorbed = MeterAbsorbed()
+	trace("fight over: " .. fight.hits .. " absorbed hits counted, meter says Mana Shield absorbed " .. tostring(absorbed))
+	if absorbed and absorbed > 0 and fight.hits > 0 and not fight.unsure then
+		LearnSample(absorbed / fight.hits, fight.keys,
+			string.format("Mana Shield absorbed %d in %d hits", absorbed, fight.hits))
+		local st = shields["Mana Shield"]
+		if st and #fight.breaks == 0 and fight.casts <= 1 then
+			st.absorbed = absorbed
+			EstimateRem(st)
+			dbg(string.format("Mana Shield after the fight: %d absorbed, ~%.0f left", absorbed, st.rem))
+		end
+	elseif not absorbed then
+		for _, b in ipairs(fight.breaks) do
+			LearnSample(b.sample, b.keys, "Mana Shield broke (no meter data)")
+		end
+	end
+	NewFight()
 end
 
 -- Shields sorted by gain time (oldest first)
@@ -479,7 +698,7 @@ end
 
 local sentTarget = {} -- castGUID -> target name from UNIT_SPELLCAST_SENT
 local buffCount = nil -- visible buttons on Blizzard's buff bar
-local countUpAt, absorbAt, ownCastAt = nil, nil, nil
+local countUpAt, countDownAt, absorbAt, ownCastAt, anyCastAt = nil, nil, nil, nil, nil
 local handledUp = 0 -- countUpAt that was already used
 
 -- Blizzard's buff buttons keep a readable IsShown in combat, even when
@@ -504,8 +723,13 @@ local function UpdateBuffCount(now)
 	if not c then
 		return
 	end
+	if buffCount and c ~= buffCount then
+		trace("Blizzard buff buttons " .. buffCount .. " -> " .. c)
+	end
 	if buffCount and c > buffCount then
 		countUpAt = now
+	elseif buffCount and c < buffCount then
+		countDownAt = now
 	end
 	buffCount = c
 end
@@ -536,106 +760,63 @@ local function CheckInference(now)
 end
 
 ------------------------------------------------------------------------
--- Mana Shield: absorbed damage from mana drops
+-- Broken shields in combat
 ------------------------------------------------------------------------
 
--- The player's mana is readable even in combat. Each mana drop waits
--- MANA_MATCH seconds; then the cost of own casts around that time is taken
--- off. What is left was drained by Mana Shield ("ratio" mana per damage).
-local MANA_MATCH = 0.3
-local lastMana = nil
-local drops = {} -- { t, amount }
-local casts = {} -- { t, cost }; cost nil = unknown
+-- In combat a shield that breaks can't be seen in the auras. But Blizzard's
+-- buff bar loses a button at that moment. If none of the buffs known from
+-- before the fight (or a tracked shield's timer) runs out right then, and no
+-- own spell was cast (which may use up a buff like Clearcasting), a shield
+-- broke. Shields counted in the total absorb come with an absorb change;
+-- Mana Shield (not counted there) without one.
+local BREAK_EXPIRY_SLACK = 1.5
+local handledDown = 0 -- countDownAt that was already used
 
-local function ManaNow()
-	if not UnitPower then
-		return nil
-	end
-	local ok, v = pcall(UnitPower, "player", 0)
-	if ok and (not IsSecret(v)) and type(v) == "number" then
-		return v
-	end
-	return nil
-end
-
--- mana cost of a spell, nil when it can't be read
-local function SpellManaCost(sid)
-	if not (C_Spell and C_Spell.GetSpellPowerCost) then
-		return nil
-	end
-	local ok, costs = pcall(C_Spell.GetSpellPowerCost, sid)
-	if (not ok) or IsSecret(costs) or type(costs) ~= "table" then
-		return nil
-	end
-	local total = 0
-	for i = 1, #costs do
-		local c = costs[i]
-		local ty, amount = Plain(Get(c, "type")), Plain(Get(c, "cost"))
-		if ty == 0 and type(amount) == "number" then
-			total = total + amount
-		elseif IsSecret(c) or (ty == 0 and amount == nil) then
-			return nil
+local function KnownExpiryNear(t)
+	for _, exp in ipairs(buffExpiries) do
+		if math.abs(exp - t) <= BREAK_EXPIRY_SLACK then
+			return true
 		end
 	end
-	return total
-end
-
-local function RecordCast(sid)
-	table.insert(casts, { t = GetTime(), cost = SpellManaCost(sid) })
-end
-
-local function OnManaChanged()
-	local cur = ManaNow()
-	if cur and lastMana and cur < lastMana then
-		table.insert(drops, { t = GetTime(), amount = lastMana - cur })
-	end
-	lastMana = cur
-end
-
-local function ProcessManaDrops(now)
-	local i = 1
-	while i <= #drops do
-		local d = drops[i]
-		if now - d.t < MANA_MATCH then
-			i = i + 1
-		else
-			local amount = d.amount
-			local unknownCost = false
-			for _, c in ipairs(casts) do
-				if amount > 0 and math.abs(c.t - d.t) <= MANA_MATCH then
-					if c.cost == nil then
-						unknownCost = true
-					elseif c.cost > 0 then
-						local use = math.min(c.cost, amount)
-						c.cost = c.cost - use
-						amount = amount - use
-					end
-				end
-			end
-			local st = shields["Mana Shield"]
-			if st and st.max and amount > 0 and d.t >= st.gained - 0.05 then
-				if unknownCost then
-					-- a cast of unknown cost at the same time: can't split the drop
-					st.est = true
-					dbg("Mana Shield: -" .. amount .. " mana next to a cast of unknown cost, not counted")
-				else
-					local ratio = (st.spellId and descRatio[st.spellId]) or 2
-					local absorbed = amount / ratio
-					st.consumed = st.consumed + absorbed
-					st.rem = math.max(0, st.max - st.consumed)
-					dbg(string.format("Mana Shield: -%d mana = %.0f absorbed, %.0f left", amount, absorbed, st.rem))
-				end
-			end
-			table.remove(drops, i)
+	for _, st in pairs(shields) do
+		if st.expires and math.abs(st.expires - t) <= BREAK_EXPIRY_SLACK then
+			return true
 		end
 	end
-	local j = 1
-	while j <= #casts do
-		if now - casts[j].t > 2 * MANA_MATCH then
-			table.remove(casts, j)
-		else
-			j = j + 1
+	return false
+end
+
+local function CheckBreak(now)
+	if not countDownAt or countDownAt <= handledDown or now - countDownAt < INFER_WINDOW then
+		return -- wait a moment: the absorb change may come right after
+	end
+	local t = countDownAt
+	handledDown = t
+	if KnownExpiryNear(t) then
+		trace("buff button gone: a known buff or shield ran out")
+		return
+	end
+	if anyCastAt and math.abs(anyCastAt - t) <= 0.5 then
+		trace("buff button gone right after an own cast: not a shield")
+		return
+	end
+	local list = ActiveList()
+	local withAbsorb = absorbAt and math.abs(absorbAt - t) <= INFER_WINDOW
+	local pick = {}
+	for _, st in ipairs(list) do
+		if (st.def.noAmount and not withAbsorb) or (withAbsorb and not st.def.noAmount) then
+			pick[#pick + 1] = st
 		end
+	end
+	if #list == 1 then
+		pick = list
+	end
+	if #pick == 1 then
+		dbg(pick[1].name .. " broke (buff button gone" .. (withAbsorb and ", absorb changed" or "") .. ")")
+		OnShieldBroke(pick[1])
+		shields[pick[1].name] = nil
+	else
+		trace("buff button gone, but can't tell which of " .. #list .. " shields broke")
 	end
 end
 
@@ -654,7 +835,8 @@ local function OnCastSucceeded(unit, guid, spellID)
 		return
 	end
 	if unit == "player" then
-		RecordCast(sid) -- every own cast: its mana cost is not a Mana Shield drain
+		anyCastAt = GetTime() -- a cast may use up a buff (see CheckBreak)
+		trace("cast " .. sid)
 	end
 	if not SHIELD_BY_ID[sid] then
 		return
@@ -1457,6 +1639,9 @@ local function Init()
 	if type(DB.maxForeign) ~= "table" then
 		DB.maxForeign = {}
 	end
+	if type(DB.hitByEnemy) ~= "table" then
+		DB.hitByEnemy = {} -- "name (level)" -> damage per absorbed hit
+	end
 	Build()
 	mover:SetScript("OnDragStart", function(self)
 		self:StartMoving()
@@ -1485,9 +1670,18 @@ f:RegisterUnitEvent("UNIT_AURA", "player")
 pcall(f.RegisterUnitEvent, f, "UNIT_ABSORB_AMOUNT_CHANGED", "player")
 f:RegisterUnitEvent("UNIT_SPELLCAST_SENT", "player")
 f:RegisterUnitEvent("UNIT_SPELLCAST_SUCCEEDED", "player", "pet") -- pet: Sacrifice
-pcall(f.RegisterUnitEvent, f, "UNIT_POWER_FREQUENT", "player") -- Mana Shield drains
+-- hits on the player (combat text): the amount is secret, but absorbed hits
+-- are flagged, which drives the Mana Shield estimate (OnAbsorbedHit)
+pcall(f.RegisterUnitEvent, f, "UNIT_COMBAT", "player")
 
-f:SetScript("OnEvent", function(self, event, a1, a2, a3, a4)
+local function Describe(v)
+	if IsSecret(v) then
+		return "<secret>"
+	end
+	return tostring(v)
+end
+
+f:SetScript("OnEvent", function(self, event, a1, a2, a3, a4, a5)
 	if event == "ADDON_LOADED" then
 		if a1 == ADDON then
 			Init()
@@ -1506,22 +1700,30 @@ f:SetScript("OnEvent", function(self, event, a1, a2, a3, a4)
 	elseif event == "PLAYER_ENTERING_WORLD" or event == "PLAYER_REGEN_ENABLED" then
 		Rescan()
 		buffCount = BlizzBuffCount()
-		lastMana = ManaNow()
-	elseif event == "UNIT_POWER_FREQUENT" then
-		if a2 == "MANA" then
-			OnManaChanged()
+		if event == "PLAYER_REGEN_ENABLED" and C_Timer and C_Timer.After then
+			C_Timer.After(0.5, LearnAfterFight) -- let the meter finish the fight
 		end
 	elseif event == "PLAYER_REGEN_DISABLED" then
 		buffCount = BlizzBuffCount()
+		NewFight()
 	elseif event == "SPELLS_CHANGED" then
 		CacheDescriptions()
 	elseif event == "UNIT_AURA" then
+		trace("event UNIT_AURA")
 		Rescan()
 	elseif event == "UNIT_ABSORB_AMOUNT_CHANGED" then
+		trace("event UNIT_ABSORB_AMOUNT_CHANGED")
 		absorbAt = GetTime()
 		Rescan()
 	elseif event == "UNIT_SPELLCAST_SENT" then
 		OnCastSent(a1, a2, a3, a4)
+	elseif event == "UNIT_COMBAT" then
+		trace("UNIT_COMBAT action=" .. Describe(a2) .. " flag=" .. Describe(a3)
+			.. " amount=" .. Describe(a4) .. " school=" .. Describe(a5)
+			.. (shields["Mana Shield"] and " (Mana Shield up)" or ""))
+		if Plain(a3) == "ABSORB" or Plain(a2) == "ABSORB" then
+			OnAbsorbedHit(Plain(a5))
+		end
 	elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
 		OnCastSucceeded(a1, a2, a3)
 	end
@@ -1538,11 +1740,11 @@ f:SetScript("OnUpdate", function(self, elapsed)
 	if tickAcc >= (locked and COMBAT_TICK or IDLE_TICK) then
 		tickAcc = 0
 		local now = GetTime()
-		ProcessManaDrops(now)
 		if locked then
 			ForgetAuraValues()
 			UpdateBuffCount(now)
 			CheckInference(now)
+			CheckBreak(now)
 			ExpireShields(now)
 		elseif next(shields) then
 			if not Rescan() then
@@ -1563,6 +1765,7 @@ local function PrintHelp()
 	say("  style dot||square - use 'square' if the dots look wrong (now " .. DB.style .. ")")
 	say("  smooth          - toggle drawing each bar as one layer (now " .. (DB.smooth and "on" or "off") .. ")")
 	say("  status          - list the tracked shields")
+	say("  total           - show the game's total absorb (test)")
 	say("  debug           - print what the tracking decides")
 end
 
@@ -1574,10 +1777,44 @@ local function PrintStatus()
 	local now = GetTime()
 	for _, st in ipairs(list) do
 		say(string.format("%s: %s, remaining %s / max %s, %ds left",
-			st.name, st.source, st.rem and tostring(st.rem) or "secret total",
+			st.name, st.source, st.rem and ((st.est and "~" or "") .. tostring(st.rem)) or "secret total",
 			tostring(st.max), math.floor((st.expires or now) - now + 0.5)))
 	end
 	say("in combat lockdown: " .. tostring(InCombatLockdown()) .. ", Blizzard buff buttons: " .. tostring(BlizzBuffCount()))
+	local key = EnemyKey()
+	local learned = 0
+	for _ in pairs(DB.hitByEnemy) do
+		learned = learned + 1
+	end
+	say(string.format("Mana Shield estimate: ~%.0f per absorbed hit vs %s (%d enemies learned)",
+		DamagePerHit(key), key or "no hostile target", learned))
+end
+
+-- /aa total: shows the game's total absorb (a secret value the game draws
+-- itself) at the top of the screen, to check which shields it includes
+local totalFrame = nil
+local function ToggleTotal()
+	if not totalFrame then
+		totalFrame = CreateFrame("Frame", nil, UIParent)
+		totalFrame:SetSize(1, 1)
+		totalFrame:SetPoint("TOP", UIParent, "TOP", 0, -120)
+		totalFrame.text = totalFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+		totalFrame.text:SetPoint("TOP", totalFrame, "TOP", 0, 0)
+		totalFrame:SetScript("OnUpdate", function(self)
+			local ok, v = pcall(UnitGetTotalAbsorbs, "player")
+			if ok and not pcall(self.text.SetFormattedText, self.text, "AbsorbArc test - total absorb: %d", v) then
+				pcall(self.text.SetText, self.text, v)
+			end
+		end)
+		totalFrame:Hide()
+	end
+	if totalFrame:IsShown() then
+		totalFrame:Hide()
+		say("total absorb display off")
+	else
+		totalFrame:Show()
+		say("total absorb display on (top of the screen)")
+	end
 end
 
 local function NumCmd(rest, key, lo, hi, usage)
@@ -1656,9 +1893,15 @@ SlashCmdList["ABSORBARC"] = function(input)
 		say("smooth bars " .. (DB.smooth and "on" or "off") .. (supported and "" or " (not supported by this client)"))
 	elseif cmd == "status" then
 		PrintStatus()
+	elseif cmd == "total" then
+		ToggleTotal()
 	elseif cmd == "debug" then
 		DB.debug = not DB.debug
-		say("debug " .. (DB.debug and "on" or "off"))
+		if DB.debug then
+			DB.debugLog = {}
+			trace("debug on, v" .. tostring(GetMeta("Version")))
+		end
+		say("debug " .. (DB.debug and "on (log saved on /reload)" or "off"))
 	else
 		PrintHelp()
 	end
