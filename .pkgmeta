@@ -1,9 +1,16 @@
 package-as: AbsorbArc
 
+# changelog shown for each file on CurseForge
+manual-changelog:
+  filename: CHANGELOG.md
+  markup-type: markdown
+
 # ship only what the game loads: AbsorbArc.toc, AbsorbArc_Camelot.toc,
 # AbsorbArc.lua and dot_smooth.tga
 ignore:
   - README.md
+  - CHANGELOG.md
   - LICENSE
   - screenshots
   - absorbarc_logo.png
+  - absorbarc_logo_400.png
