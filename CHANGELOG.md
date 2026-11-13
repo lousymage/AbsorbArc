@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.5
+
+- Fixed: Power Word: Shield cast on yourself in combat showed only a small
+  part of the arc. Your own cast wasn't recognized when the game reported
+  your name with the realm, so the shield was treated as someone else's
+  with a far too large maximum.
+- Missing spell descriptions (they load in the background) are fetched
+  again out of combat, so shield sizes are known before the first fight.
+
 ## 0.5.4
 
 - Fixed: the Mana Shield arc stayed after the shield broke. A shield that

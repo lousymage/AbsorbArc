@@ -1,4 +1,4 @@
--- AbsorbArc 0.5.4 -- WoW: Forever (client 1.60.1, interface 16001, Lua 5.1)
+-- AbsorbArc 0.5.5 -- WoW: Forever (client 1.60.1, interface 16001, Lua 5.1)
 -- Shows the remaining absorb of several shield spells as bars (arc or
 -- straight) next to each other.
 --
@@ -262,13 +262,19 @@ local function KnownMax(name, spellId, mine)
 	elseif not mine then
 		v = Positive(DB.maxForeign[name])
 	end
-	if not v and spellId then
+	if v then
+		return v, "learned"
+	end
+	if spellId then
 		if not descBase[spellId] then
 			CacheDescriptions() -- descriptions load in the background; try again
 		end
 		v = Positive(descBase[spellId])
+		if v then
+			return v, "description"
+		end
 	end
-	return v or SHIELDS[name].fallback
+	return SHIELDS[name].fallback, "default"
 end
 
 ------------------------------------------------------------------------
@@ -498,7 +504,7 @@ local function ApplyScan(found)
 					end
 				elseif not st.max then
 					-- joined late (e.g. /reload): best guess for the full value
-					st.max = math.max(rem, KnownMax(name, info.spellId, info.mine))
+					st.max = math.max(rem, (KnownMax(name, info.spellId, info.mine)))
 				end
 				if rem > st.max then
 					st.max = rem
@@ -539,13 +545,14 @@ end
 -- remaining amount from the secret total absorb.
 local function StartUnseen(name, spellId, source)
 	local st = NewShield(name, spellId, source)
-	st.max = KnownMax(name, spellId, source == "cast")
+	local from
+	st.max, from = KnownMax(name, spellId, source == "cast")
 	if st.def.noAmount then
 		EstimateRem(st)
 		fight.casts = fight.casts + 1
 	end
 	shields[name] = st
-	dbg(name .. " started in combat (" .. source .. ", max " .. st.max .. ")")
+	dbg(name .. " started in combat (" .. source .. ", max " .. st.max .. " from " .. from .. ")")
 end
 
 -- Per fight: Mana Shield's absorbed hits and from whom. After the fight the
@@ -699,6 +706,7 @@ end
 local sentTarget = {} -- castGUID -> target name from UNIT_SPELLCAST_SENT
 local buffCount = nil -- visible buttons on Blizzard's buff bar
 local countUpAt, countDownAt, absorbAt, ownCastAt, anyCastAt = nil, nil, nil, nil, nil
+local ownPwsOther = nil -- { t, spellId } of an own PW:S cast that seemed to go to someone else
 local handledUp = 0 -- countUpAt that was already used
 
 -- Blizzard's buff buttons keep a readable IsShown in combat, even when
@@ -754,6 +762,11 @@ local function CheckInference(now)
 	handledUp = countUpAt
 	if ownCastAt and now - ownCastAt < 1.5 then
 		dbg("buff + absorb change right after own shield cast: nothing to infer")
+	elseif ownPwsOther and now - ownPwsOther.t < 2 then
+		-- the own PW:S that seemed to target someone else landed on us
+		dbg(PWS .. ": the own cast landed on you after all")
+		StartUnseen(PWS, ownPwsOther.spellId, "cast")
+		ownPwsOther = nil
 	else
 		StartUnseen(PWS, nil, "inferred")
 	end
@@ -846,8 +859,12 @@ local function OnCastSucceeded(unit, guid, spellID)
 		local tgt = sentTarget[guid]
 		sentTarget[guid] = nil
 		local me = UnitName("player")
-		if type(tgt) == "string" and (not IsSecret(tgt)) and tgt ~= "" and tgt ~= me then
+		local function Base(n)
+			return type(n) == "string" and string.match(n, "^([^%-]+)") or n
+		end
+		if type(tgt) == "string" and (not IsSecret(tgt)) and tgt ~= "" and Base(tgt) ~= Base(me) then
 			dbg(PWS .. " cast on " .. tgt .. ", not on you")
+			ownPwsOther = { t = GetTime(), spellId = sid }
 			return
 		end
 	end
@@ -1729,7 +1746,7 @@ f:SetScript("OnEvent", function(self, event, a1, a2, a3, a4, a5)
 	end
 end)
 
-local tickAcc = 0
+local tickAcc, descTry = 0, 0
 f:SetScript("OnUpdate", function(self, elapsed)
 	if not DB then
 		return
@@ -1746,10 +1763,14 @@ f:SetScript("OnUpdate", function(self, elapsed)
 			CheckInference(now)
 			CheckBreak(now)
 			ExpireShields(now)
-		elseif next(shields) then
-			if not Rescan() then
+		else
+			if next(shields) and not Rescan() then
 				ForgetAuraValues()
 				ExpireShields(now)
+			end
+			if now - descTry > 10 then
+				descTry = now
+				CacheDescriptions() -- fills in descriptions that weren't loaded yet
 			end
 		end
 	end

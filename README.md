@@ -14,7 +14,7 @@ with the remaining amount and the seconds left next to it.
   side, opacity and position
 - settings saved per character
 
-For **WoW: Forever** (client 1.60.1). Version **0.5.4**.
+For **WoW: Forever** (client 1.60.1). Version **0.5.5**.
 
 ## Shields
 
