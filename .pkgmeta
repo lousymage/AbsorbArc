@@ -1,0 +1,9 @@
+package-as: AbsorbArc
+
+# ship only what the game loads: AbsorbArc.toc, AbsorbArc_Camelot.toc,
+# AbsorbArc.lua and dot_smooth.tga
+ignore:
+  - README.md
+  - LICENSE
+  - screenshots
+  - absorbarc_logo.png

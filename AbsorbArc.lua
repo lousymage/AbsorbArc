@@ -1,4 +1,4 @@
--- AbsorbArc 0.5.2 -- WoW: Forever (client 1.60.1, interface 16001, Lua 5.1)
+-- AbsorbArc 0.5.3 -- WoW: Forever (client 1.60.1, interface 16001, Lua 5.1)
 -- Shows the remaining absorb of several shield spells as bars (arc or
 -- straight) next to each other.
 --
